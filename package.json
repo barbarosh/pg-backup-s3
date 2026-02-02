@@ -1,0 +1,16 @@
+{
+  "name": "pg-backup-s3",
+  "version": "1.0.0",
+  "author": "Oleksii Barbarosh",
+  "main": "backup.js",
+  "license": "MIT",
+  "scripts": {
+    "backup-dry-run": "node backup.js --dry-run",
+    "backup-gzip": "node backup.js",
+    "backup-zstd": "node backup.js --compress=zstd"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "3.981.0",
+    "dotenv": "16.6.1"
+  }
+}
