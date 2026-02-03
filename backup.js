@@ -64,7 +64,7 @@ if (compress === "zstd") {
   compressCmd = "zstd -15 -T0";
   ext = "zst";
 } else {
-  compressCmd = "gzip -9";
+  compressCmd = "gzip -5";
   ext = "gz";
 }
 

@@ -13,4 +13,4 @@ RUN yarn install --frozen-lockfile
 
 COPY backup.js ./
 
-ENTRYPOINT ["yarn","run", "backup-zstd"]
+ENTRYPOINT ["yarn", "run", "backup-gzip"]
