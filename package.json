@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.981.0",
+    "@aws-sdk/lib-storage": "3.1063.0",
     "dotenv": "16.6.1"
   }
 }

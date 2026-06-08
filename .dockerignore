@@ -5,3 +5,4 @@ backups
 .gitignore
 *.md
 .DS_Store
+.idea

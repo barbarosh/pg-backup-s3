@@ -8,10 +8,10 @@ import dotenv from 'dotenv';
 
 import {
   S3Client,
-  PutObjectCommand,
   ListObjectsV2Command,
   DeleteObjectsCommand,
 } from "@aws-sdk/client-s3";
+import { Upload } from "@aws-sdk/lib-storage";
 
 const execAsync = promisify(exec);
 
@@ -36,8 +36,19 @@ const S3_BUCKET = process.env.S3_BUCKET || "my-postgres-backups";
 const S3_PREFIX = process.env.S3_PREFIX || "pg";
 const AWS_REGION = process.env.AWS_REGION || "eu-west-1";
 
-const RETENTION_DAYS = 7;
-const MIN_FILES = 7;
+const MIN_BACKUP_DAYS = getIntEnv("MIN_BACKUP_DAYS") ?? 7;
+const S3_MIN_PART_SIZE = 5 * 1024 * 1024;
+const S3_MULTIPART_PART_SIZE =
+  (getIntEnv("S3_MULTIPART_PART_SIZE_MB") ?? 64) * 1024 * 1024;
+const S3_MULTIPART_QUEUE_SIZE = getIntEnv("S3_MULTIPART_QUEUE_SIZE") ?? 4;
+
+if (S3_MULTIPART_PART_SIZE < S3_MIN_PART_SIZE) {
+  throw new Error("Invalid S3_MULTIPART_PART_SIZE_MB: must be at least 5");
+}
+
+if (S3_MULTIPART_QUEUE_SIZE < 1) {
+  throw new Error("Invalid S3_MULTIPART_QUEUE_SIZE: must be at least 1");
+}
 
 /* ============================================ */
 
@@ -57,14 +68,32 @@ const compress =
   process.argv.find(a => a.startsWith("--compress="))?.split("=")[1]
   || "gzip";
 
+function getIntEnv(name) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return undefined;
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isFinite(value)) {
+    throw new Error(`Invalid ${name}: "${raw}" (must be an integer)`);
+  }
+  return value;
+}
+
 let compressCmd;
 let ext;
 
 if (compress === "zstd") {
-  compressCmd = "zstd -15 -T0";
+  const level = getIntEnv("ZSTD_LEVEL") ?? getIntEnv("COMPRESSION_LEVEL") ?? 15;
+  if (level < 1 || level > 19) {
+    throw new Error(`Invalid zstd compression level: ${level} (expected 1..19)`);
+  }
+  compressCmd = `zstd -${level} -T0`;
   ext = "zst";
 } else {
-  compressCmd = "gzip -5";
+  const level = getIntEnv("GZIP_LEVEL") ?? getIntEnv("COMPRESSION_LEVEL") ?? 5;
+  if (level < 1 || level > 9) {
+    throw new Error(`Invalid gzip compression level: ${level} (expected 1..9)`);
+  }
+  compressCmd = `gzip -${level}`;
   ext = "gz";
 }
 
@@ -76,14 +105,16 @@ const s3 = new S3Client({
   region: AWS_REGION,
   credentials: process.env.AWS_ACCESS_KEY_ID
     ? {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-      }
+      accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+    }
     : undefined,
 });
 
 async function createBackup() {
   log("Creating PostgresSQL backup");
+
+  if (DRY_RUN) return;
 
   const pgDumpallCmd = `
   set -euo pipefail
@@ -124,15 +155,30 @@ async function uploadToS3() {
     throw new Error(`Backup file not found: ${filepath}`);
   }
 
+  const { size } = await fsPromises.stat(filepath);
   const stream = fs.createReadStream(filepath);
-
-  await s3.send(
-    new PutObjectCommand({
+  const upload = new Upload({
+    client: s3,
+    params: {
       Bucket: S3_BUCKET,
       Key: s3Key,
       Body: stream,
-    })
+    },
+    partSize: S3_MULTIPART_PART_SIZE,
+    queueSize: S3_MULTIPART_QUEUE_SIZE,
+    leavePartsOnError: false,
+  });
+
+  upload.on("httpUploadProgress", (progress) => {
+    if (progress.loaded && progress.total) {
+      log(`Uploaded ${progress.loaded}/${progress.total} bytes to S3`);
+    }
+  });
+
+  log(
+    `Upload size: ${size} bytes; multipart part size: ${S3_MULTIPART_PART_SIZE} bytes`
   );
+  await upload.done();
 }
 
 async function cleanupLocal() {
@@ -170,26 +216,49 @@ async function cleanupS3() {
 
   log(`Found ${objects.length} backups in S3`);
 
-  if (objects.length <= MIN_FILES) {
-    log("Retention skipped (minimum files threshold)");
-    return;
+  const backups = objects
+    .map((object) => {
+      if (!object.LastModified) return null;
+
+      const day = object.LastModified.toISOString().slice(0, 10);
+      return {
+        object,
+        date: object.LastModified,
+        day,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.date.getTime() - a.date.getTime());
+  const skippedObjects = objects.length - backups.length;
+
+  if (skippedObjects > 0) {
+    log(`Skipped objects without LastModified metadata: ${skippedObjects}`);
   }
 
-  const cutoff = Date.now() - RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  const protectedDays = new Set();
 
-  const expired = objects.filter(
-    (o) => o.LastModified && o.LastModified.getTime() < cutoff
+  for (const backup of backups) {
+    if (protectedDays.size >= MIN_BACKUP_DAYS) break;
+    protectedDays.add(backup.day);
+  }
+
+  const retentionCandidates = backups.filter(
+    (backup) => !protectedDays.has(backup.day)
   );
 
-  if (expired.length === 0) {
-    log("No expired backups found");
+  if (retentionCandidates.length === 0) {
+    log("Retention skipped (minimum unique backup days threshold)");
     return;
   }
 
-  log(`Expired backups: ${expired.length}`);
+  log(`Protected latest unique backup days: ${protectedDays.size}`);
 
-  expired.forEach((o) =>
-    console.log(`  - ${o.Key} (${o.LastModified.toISOString()})`)
+  const deletable = retentionCandidates;
+
+  log(`Backups outside protected unique days: ${deletable.length}`);
+
+  deletable.forEach((o) =>
+    console.log(`  - ${o.object.Key} (${o.date.toISOString()})`)
   );
 
   if (DRY_RUN) {
@@ -201,12 +270,12 @@ async function cleanupS3() {
     new DeleteObjectsCommand({
       Bucket: S3_BUCKET,
       Delete: {
-        Objects: expired.map((o) => ({ Key: o.Key })),
+        Objects: deletable.map((o) => ({ Key: o.object.Key })),
       },
     })
   );
 
-  log("Expired backups deleted");
+  log("Backups outside protected unique days deleted");
 }
 
 async function main() {
